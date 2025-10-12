@@ -1,0 +1,4 @@
+/home/lyq/project/hpcserver/threadpool/tests/build/CMakeFiles/test_threadpool.dir
+/home/lyq/project/hpcserver/threadpool/tests/build/CMakeFiles/test.dir
+/home/lyq/project/hpcserver/threadpool/tests/build/CMakeFiles/edit_cache.dir
+/home/lyq/project/hpcserver/threadpool/tests/build/CMakeFiles/rebuild_cache.dir
