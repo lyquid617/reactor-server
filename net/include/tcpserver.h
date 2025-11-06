@@ -9,6 +9,7 @@
 #include "eventloop.h"
 #include "tcpconn.h"
 #include "timer.h"
+#include "threadpool.h"
 
 class TcpServer {
 public:
@@ -29,10 +30,12 @@ private:
     
     int listen_fd_;
     EventLoop main_loop_;
-    int thread_num_;
+    std::thread main_thread_;
+    int io_thread_num_;
     std::atomic<int> next_loop_index_;
     std::vector<std::unique_ptr<EventLoop>> loops_;
-    std::vector<std::thread> threads_;
+
+    std::unique_ptr<ThreadPool> threadpool_;
     std::atomic<bool> running_{false};
     
     ConnectionTimeoutManager timeout_manager_;

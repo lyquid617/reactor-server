@@ -71,10 +71,16 @@ public:
             std::bind(std::forward<F>(f), std::forward<Args>(args)...)
         );
 
+        // auto task_lambda = std::make_shared<std::packaged_task<return_type()>>(
+        //     [func = std::forward<F>(f), ...args = std::forward<Args>(args)]() mutable {
+        //     return std::invoke(func, args...);
+        // });
+
         // 2. 获取与任务关联的 future
         std::future<return_type> res = task->get_future();
 
         // 3. 将任务封装后放入队列
+        // use a {} to restrain the lock lifetime
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             tasks.emplace([task](){ (*task)(); }); // 将任务放入队列

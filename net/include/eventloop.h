@@ -15,7 +15,7 @@ public:
     void add_fd(int fd, uint32_t events, const EventCallback& cb);
     void modify_fd(int fd, uint32_t events);
     void remove_fd(int fd);
-    // worker loop
+    // worker loop, default idle until binding a fd
     void run();
     void stop();
     

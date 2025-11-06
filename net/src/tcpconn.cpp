@@ -18,9 +18,16 @@ void TcpConnection::set_close_callback(const CloseCallback &cb){
 }
 
 void TcpConnection::establish(){
-    // use epoll to monitor this lambda
+    auto weak_self = weak_from_this();
     loop_->add_fd(fd_, EPOLLIN | EPOLLRDHUP | EPOLLET, 
-            [this](int fd, uint32_t events) { handle_events(fd, events); });
+        [weak_self](int fd, uint32_t events) {
+            if (auto self = weak_self.lock()) {
+                self->handle_events(fd, events);
+            }
+        });
+
+    // loop_->add_fd(fd_, EPOLLIN | EPOLLRDHUP | EPOLLET, 
+    //         [this](int fd, uint32_t events) { handle_events(fd, events); });
 }
 
 void TcpConnection::send(const char* data, size_t len) {
@@ -61,11 +68,11 @@ void TcpConnection::handle_events(int fd, uint32_t events) {
 }
     
 void TcpConnection::handle_read() {
-    char buffer[4096];
+    auto buffer = BufferMemoryPool::instance().acquire(4096);
     ssize_t n;
     
     while (true) {
-        n = read(fd_, buffer, sizeof(buffer));
+        n = buffer->readFromFD(fd_);
         if (n > 0) {
             if (data_callback_) {
                 data_callback_(shared_from_this(), buffer, n);

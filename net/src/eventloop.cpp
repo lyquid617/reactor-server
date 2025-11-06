@@ -24,7 +24,7 @@ void EventLoop::add_fd(int fd, uint32_t events, const EventCallback& cb){
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == -1) {
         throw std::system_error(errno, std::system_category(), "epoll_ctl add failed");
     }
-    
+    // register the callback function to this fd (hashmap)
     callbacks_[fd] = cb;
 }
 

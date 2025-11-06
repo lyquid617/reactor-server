@@ -3,10 +3,12 @@
 #include <memory>
 #include <functional>
 #include "eventloop.h"
+#include "buffer/singletonBufferPool.h"
+
 
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
-    using DataCallback = std::function<void(std::shared_ptr<TcpConnection>, const char*, size_t)>;
+    using DataCallback = std::function<void(std::shared_ptr<TcpConnection>, std::shared_ptr<Buffer>, size_t)>;
     using CloseCallback = std::function<void(std::shared_ptr<TcpConnection>)>;
     
     TcpConnection(int fd, EventLoop* loop);
@@ -14,10 +16,12 @@ public:
     
     void set_data_callback(const DataCallback& cb);
     void set_close_callback(const CloseCallback& cb);
+
+    // add the connection fd to epoll list
     void establish();
     void send(const char* data, size_t len);
     void close();
-    
+
     int fd() const;
     
 private:
