@@ -1,80 +1,177 @@
 #include "eventloop.h"
-#include <system_error>
+#include "logger.h"
 #include <iostream>
 #include <unistd.h>
+#include <sys/eventfd.h>
 
-EventLoop::EventLoop() : running_(false) {
-    epoll_fd_ = epoll_create1(0);
-    if (epoll_fd_ == -1) {
-        throw std::system_error(errno, std::system_category(), "epoll_create1 failed");
+// prevent from creating more than one loop on a single thread
+thread_local EventLoop* t_loopInThisThread = nullptr;
+
+static int createWakeupFd(){
+    int evfd = eventfd(0, EFD_NONBLOCK | EFD_NONBLOCK);
+    if(evfd < 0){
+        LOG_ERROR << "Wakeup fd creation failed";
+    }else{
+        LOG_DEBUG << "Create a new wakeup fd : " << evfd;
     }
+    return evfd;
+}
+
+void EventLoop::updateEpoller(int operation, Channel* ch){
+    int fd = ch->fd();
+    epoll_event event{};        // auto init to zero with {}
+    event.events = ch->events();
+    event.data.ptr = ch;
+    if(epoll_ctl( epollFd_, operation, fd, &event) < 0){
+        LOG_ERROR << "epoll_ctl failed on eventloop" << this;
+    }
+}
+
+EventLoop::EventLoop() 
+    : looping_(false) 
+    , stop_(false)
+    , doingPendingFunctors_(false)
+    , epollFd_(epoll_create1(EPOLL_CLOEXEC))
+    , eventList_(kEventListSize)
+    , threadId_(CurrentThread::tid())
+    , wakeupFd_(createWakeupFd()) 
+    , wakeupChannel_(new Channel(this, wakeupFd_)) {
+    LOG_DEBUG << "Create a new eventloop on thread " << threadId_;
+    if(t_loopInThisThread){
+        LOG_FATAL << "Another eventloop" << t_loopInThisThread << "already created on thread" << threadId_;
+    }else{
+        t_loopInThisThread = this;
+    }
+    if (epollFd_ == -1) {
+        LOG_ERROR << "epoll_create1() failed";
+    }else{
+        LOG_DEBUG << "create a new epoll fd " << epollFd_ << " on thread" << threadId_;
+    }
+    // write something to eventfd to wakeup this eventloop
+    wakeupChannel_->setReadCallBack( [this] () { handleWakeup(); } );
+    wakeupChannel_->enableReading();
+
 }
 
 EventLoop::~EventLoop(){
-    stop();
-    close(epoll_fd_);
+    ::close(epollFd_);
+
+    wakeupChannel_->disableAll();
+    wakeupChannel_->remove();
+    ::close(wakeupFd_);
+
+    t_loopInThisThread = nullptr;
 }
 
-// add fd to be monitored by this epoll instance
-void EventLoop::add_fd(int fd, uint32_t events, const EventCallback& cb){
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.fd = fd;
-    
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == -1) {
-        throw std::system_error(errno, std::system_category(), "epoll_ctl add failed");
+void EventLoop::updateChannel(Channel *ch){
+    auto state = ch->state();
+    if(state  == ChannelState::INIT){
+        // add a new conn fd to poller
+        int fd = ch->fd();
+        channels_[fd] = ch;
+
+        updateEpoller(EPOLL_CTL_ADD, ch);
+        ch->setState(ChannelState::POLLING);
+    }else if(state == ChannelState::POLLING){
+        if(ch->isNonEvent()){
+            // remove the polling fd from epoll fd set
+            updateEpoller(EPOLL_CTL_DEL, ch);
+            ch->setState(ChannelState::REMOVED);
+        }else{
+            // just mod the events
+            updateEpoller(EPOLL_CTL_MOD, ch);
+        }
+    }else if(state == ChannelState::REMOVED){
+        // add back to fd set
+        // check if is removed from the channel map
+        int fd = ch->fd();
+        if( channels_.find(fd) == channels_.end() || channels_[fd] != ch ){
+            // the original channel is removed
+            LOG_ERROR << "Try updating a removed channel";
+        }else{
+            // add back to epoller
+            updateEpoller(EPOLL_CTL_ADD, ch);
+            ch->setState(ChannelState::POLLING);
+        }
     }
-    // register the callback function to this fd (hashmap)
-    callbacks_[fd] = cb;
+}
+// the state is kinda chaos
+void EventLoop::removeChannel(Channel *ch){
+    channels_.erase(ch->fd());
+    if(ch->state() == ChannelState::POLLING){
+        updateEpoller(EPOLL_CTL_DEL, ch);
+    }
+    ch->setState(ChannelState::REMOVED);
 }
 
-void EventLoop::modify_fd(int fd, uint32_t events){
 
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.fd = fd;
-    
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
-        throw std::system_error(errno, std::system_category(), "epoll_ctl mod failed");
+bool EventLoop::hasChannel(Channel *ch){
+    return channels_.find(ch->fd()) != channels_.end() && channels_[ch->fd()] == ch;
+}
+
+void EventLoop::wakeup(){
+    uint64_t one = 1;
+    auto n = write(wakeupFd_, &one, sizeof(one));
+    if(n != sizeof(one)){
+        LOG_ERROR << "Writing wakeup fd more than 8 bytes";
     }
 }
 
-void EventLoop::remove_fd(int fd){
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-        // 忽略错误，可能fd已关闭
+void EventLoop::handleWakeup(){
+    uint64_t buf{};
+    auto n = read(wakeupFd_, &buf, sizeof(buf));
+    if(buf != 1 || n != sizeof(buf)){
+        LOG_ERROR << "Wakeup fd polluted";
     }
-    callbacks_.erase(fd);
 }
+
 
 void EventLoop::run(){
-    running_ = true;
-    const int MAX_EVENTS = 64;
-    epoll_event events[MAX_EVENTS];
-    
-    while (running_) {
-        // TODO: use suitable wait mode for your need
-        int n = epoll_wait(epoll_fd_, events, MAX_EVENTS, 100); // 100ms超时
-        
+    looping_ = true;
+    stop_ = false;
+    // reuse eventList buffer while supporting dynamic extention
+    while (!stop_) {
+        activeChannels_.clear();
+        int n = epoll_wait(epollFd_, eventList_.data() , static_cast<int>(eventList_.size()), 100); // 100ms超时
+        lastEpollTime_ = TimeStamp::now();
         if (n == -1) {
             if (errno == EINTR) continue;
-            throw std::system_error(errno, std::system_category(), "epoll_wait failed");
+            LOG_ERROR << "epoll_wait() failed";
         }
-        
+        if (n == eventList_.size()) {   // manualy resize since we use it as static array
+            eventList_.resize(eventList_.size() * 2);
+        }
         for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
-            uint32_t revents = events[i].events;
-            
-            if (callbacks_.count(fd)) {
-                try {
-                    callbacks_[fd](fd, revents);
-                } catch (const std::exception& e) {
-                    std::cerr << "Event callback error: " << e.what() << std::endl;
-                }
-            }
+            Channel *channel = static_cast<Channel*>(eventList_[i].data.ptr);
+            channel->setRevents(eventList_[i].events);
+            activeChannels_.push_back(channel);
         }
+        // a middle layer can support priority, filter... in the future
+        for (Channel *channel : activeChannels_){
+            channel->handleEvent(lastEpollTime_);
+        }
+
+        doPendingFunctors();
     }
+    looping_ = false;
 }
 
 void EventLoop::stop() {
-    running_ = false;
+    stop_ = true;
+    // wakeup blocking epoll_wait() so can destruct inmediately
+    if(!isInLoopThread()) wakeup();
+    // current thread calling stop means not blocked
+}
+
+void EventLoop::doPendingFunctors(){
+    std::vector<Functor> functors;
+    doingPendingFunctors_ = true;
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        functors.swap(pendingFunctors_);  // use cache to make fine-grain lock
+    }   
+    for(const Functor &functor : functors){
+        functor();
+    }
+    doingPendingFunctors_ = false;
 }

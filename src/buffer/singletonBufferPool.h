@@ -1,5 +1,7 @@
 #pragma once
 
+#include "noncopyable.h"
+
 #include <memory>
 #include <unistd.h>
 #include <sys/types.h>
@@ -13,16 +15,20 @@
 #include <cerrno>
 #include <stdexcept>
 
+// constructor should be protected, can't directly construct
 class Buffer {
 public:
     explicit Buffer(size_t size = 4096)
         : data_(new char[size]), capacity_(size), read_pos_(0), write_pos_(0) {}
 
+    ~Buffer() = default;
+
+
     // expose capacity for pools
     size_t capacity() const { return capacity_; }
 
-    // 使用智能指针，默认析构足够
-    ~Buffer() = default;
+    char *data() const { return data_.get(); }
+
 
     // read data from socket fd -> this buffer 
     // buffer writer
@@ -143,7 +149,7 @@ private:
     size_t write_pos_;
 };
 
-class FixedSizePool {
+class FixedSizePool : Noncopyable {
 public:
     // manage shared_ptr<Buffer> with fixed capacity
     FixedSizePool(size_t block_size, size_t prealloc_count = 100)
@@ -152,9 +158,6 @@ public:
     }
 
     ~FixedSizePool() = default;
-
-    FixedSizePool(const FixedSizePool&) = delete;
-    FixedSizePool& operator=(const FixedSizePool&) = delete;
 
     // allocate returns a shared_ptr<Buffer> from pool or creates a new one
     std::shared_ptr<Buffer> allocate() {
@@ -184,6 +187,7 @@ public:
     }
 
     size_t block_size() const { return block_size_; }
+    size_t free_block_count() const { return free_list_.size(); }
 
 private:
     void preallocate(size_t count) {
@@ -200,55 +204,105 @@ private:
     static constexpr size_t MAX_EXPAND_SIZE = 1000;
 };
 
-class BufferMemoryPool {
+// singleton instance
+class BufferMemoryPool : Noncopyable {
 public:
-    // 按大小分级的池
-    enum class PoolType {
-        SMALL,    // 64B-1KB
-        MEDIUM,   // 1KB-8KB
-        LARGE,    // 8KB-64KB
-        HUGE      // 64KB+
-    };
-
     static BufferMemoryPool& instance() {
         static BufferMemoryPool pool;
         return pool;
     }
+    // only moveable
+    class PooledBuffer : Noncopyable{
+    public:
+        PooledBuffer() = default;
+        PooledBuffer(std::shared_ptr<Buffer> buf) : buf_{buf} {};
+        ~PooledBuffer() {
+            if (buf_) {
+               BufferMemoryPool::instance().release(buf_);
+            }
+        }
+        PooledBuffer(PooledBuffer &&other){
+            buf_.swap(other.buf_);
+        }
+        PooledBuffer& operator=(PooledBuffer &&other){
+            if(this != &other){
+                if (buf_) {
+                    BufferMemoryPool::instance().release(buf_);     // key!!!!
+                }
+                buf_ = std::move(other.buf_);   // should not swap
+            }
+            return *this;
+        }
+        std::shared_ptr<Buffer> get() const { return buf_; }
 
-    std::shared_ptr<Buffer> acquire(size_t size) {
+        std::shared_ptr<Buffer> operator->() const { return buf_; }     // key!!!!
+        explicit operator bool() const { return buf_ != nullptr; }
+
+
+    private:
+        std::shared_ptr<Buffer> buf_;
+    };
+    friend class PooledBuffer;
+
+    PooledBuffer acquire(size_t size) {
         // choose appropriate pool by size
-        if (size <= 256) {
-            return pools_[0] ? pools_[0]->allocate() : std::make_shared<Buffer>(size);
-        } else if (size <= 1024) {
-            return pools_[1] ? pools_[1]->allocate() : std::make_shared<Buffer>(size);
-        } else if (size <= 8 * 1024) {
-            return pools_[2] ? pools_[2]->allocate() : std::make_shared<Buffer>(size);
-        } else if (size <= 64 * 1024) {
-            return pools_[3] ? pools_[3]->allocate() : std::make_shared<Buffer>(size);
+        for(auto &pool : pools_){
+            if(size <= pool->block_size()){
+                return pool->allocate();
+            }
         }
         // for huge sizes, allocate direct
         return std::make_shared<Buffer>(size);
     }
 
-    void release(std::shared_ptr<Buffer> buffer) {
+    void release(std::shared_ptr<Buffer> buffer){
         if (!buffer) return;
         size_t cap = buffer->capacity();
-        if (cap == 256 && pools_[0]) { pools_[0]->deallocate(std::move(buffer)); return; }
-        if (cap == 1024 && pools_[1]) { pools_[1]->deallocate(std::move(buffer)); return; }
-        if (cap == 8 * 1024 && pools_[2]) { pools_[2]->deallocate(std::move(buffer)); return; }
-        if (cap == 64 * 1024 && pools_[3]) { pools_[3]->deallocate(std::move(buffer)); return; }
-        // otherwise let shared_ptr free it
+        for(auto &pool : pools_){
+            if(cap == pool->block_size()){
+                pool->deallocate(std::move(buffer));
+                return;
+            }
+        }
     }
 
-    // 显式构造函数，初始化每个 FixedSizePool
+    void release(PooledBuffer &pooledBuffer) {
+        auto buffer = pooledBuffer.get();
+        if (!buffer) return;
+        size_t cap = buffer->capacity();
+        for(auto &pool : pools_){
+            if(cap == pool->block_size()){
+                pool->deallocate(std::move(buffer));
+                return;
+            }
+        }
+
+        // otherwise let shared_ptr free it
+        // it is a problem some Buffer may be out of management
+    }
+
+
     BufferMemoryPool() {
-        pools_[0] = std::make_unique<FixedSizePool>(256, 100);
-        pools_[1] = std::make_unique<FixedSizePool>(1024, 100);
-        pools_[2] = std::make_unique<FixedSizePool>(8 * 1024, 50);
-        pools_[3] = std::make_unique<FixedSizePool>(64 * 1024, 10);
+        pools_.emplace_back(std::make_unique<FixedSizePool>(kSmallSize, 100));
+        pools_.emplace_back(std::make_unique<FixedSizePool>(kMediumSize, 100));
+        pools_.emplace_back(std::make_unique<FixedSizePool>(kLargeSize, 50));
+        pools_.emplace_back(std::make_unique<FixedSizePool>(kHugeSize, 10));
+    }
+
+    // for test use
+    size_t free_count(int index){
+        return pools_[index]->free_block_count();
     }
 
 private:
-    // 使用 unique_ptr，避免 FixedSizePool 的不可拷贝/不可移动导致的初始化问题
-    std::array<std::unique_ptr<FixedSizePool>, 4> pools_;
+    static constexpr size_t kSmallSize = 256;
+    static constexpr size_t kMediumSize = 1024;
+    static constexpr size_t kLargeSize = 8 * 1024;
+    static constexpr size_t kHugeSize = 64 * 1024;
+
+    std::vector<std::unique_ptr<FixedSizePool>> pools_;
 };
+
+// TODO: 
+// weired
+using PooledBuffer = BufferMemoryPool::PooledBuffer;

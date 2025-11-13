@@ -22,7 +22,7 @@ public:
     }
     
     // like [2025/11/08 18:03:13.295632]
-    std::string toFormattedString(bool showMicroseconds = false) const{
+    std::string toFormattedString(bool showMicroseconds = true) const{
         auto tp = system_clock::time_point(
             duration_cast<system_clock::duration>(microSecondsSinceEpoch_));
         std::time_t time = system_clock::to_time_t(tp);

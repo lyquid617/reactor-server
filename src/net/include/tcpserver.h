@@ -1,5 +1,4 @@
-#ifndef TCPSERVER_H
-#define TCPSERVER_H
+#pragma once
 
 #include <vector>
 #include <memory>
@@ -7,7 +6,7 @@
 #include <atomic>
 #include <functional>
 #include "eventloop.h"
-#include "tcpconn.h"
+#include "tcpconnection.h"
 #include "timer.h"
 #include "threadpool.h"
 
@@ -28,7 +27,7 @@ private:
     void handle_timeout(int fd);
     EventLoop* get_next_loop();
     
-    int listen_fd_;
+    int listen_fd_;     // server socket
     EventLoop main_loop_;
     std::thread main_thread_;
     int io_thread_num_;
@@ -44,5 +43,3 @@ private:
     std::function<void(std::shared_ptr<TcpConnection>)> connection_callback_;
     typename TcpConnection::DataCallback message_callback_;
 };
-
-#endif // TCPSERVER_H
